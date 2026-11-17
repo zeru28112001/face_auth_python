@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Any
 import numpy as np
 
 from db.base import BaseFaceRepository
@@ -15,10 +15,15 @@ class AuthResult:
     similarity_score: float
     threshold: float
     detected_face: DetectedFace | None = None
+    metadata: dict | None = None
 
     @property
     def is_authenticated(self) -> bool:
         return self.status == "GRANTED"
+
+    @property
+    def is_kyc_verified(self) -> bool:
+        return bool(self.metadata and self.metadata.get("kyc_verified"))
 
 
 class FaceAuthenticator:
@@ -42,12 +47,14 @@ class FaceAuthenticator:
         self.threshold = threshold
         # Cache of known embeddings to avoid DB reads on every single frame
         self._cached_faces: list[tuple[str, np.ndarray]] = []
+        self._records_by_name: dict[str, Any] = {}
         self.reload_faces()
 
     def reload_faces(self) -> int:
         """Reloads face records from repository into memory cache."""
         records = self.repository.get_all_faces()
         self._cached_faces = [(r.name, r.embedding) for r in records]
+        self._records_by_name = {r.name: r for r in records}
         return len(self._cached_faces)
 
     def authenticate_face(
@@ -71,12 +78,15 @@ class FaceAuthenticator:
 
         # Step 5: Authentication Decision
         if best_name is not None and best_score >= self.threshold:
+            rec = self._records_by_name.get(best_name)
+            meta = rec.metadata if rec else None
             return AuthResult(
                 status="GRANTED",
                 name=best_name,
                 similarity_score=best_score,
                 threshold=self.threshold,
                 detected_face=detected_face,
+                metadata=meta,
             )
         else:
             return AuthResult(
@@ -85,6 +95,7 @@ class FaceAuthenticator:
                 similarity_score=best_score,
                 threshold=self.threshold,
                 detected_face=detected_face,
+                metadata=None,
             )
 
     def check_existing_face(self, embedding: np.ndarray) -> tuple[str | None, float]:
@@ -97,6 +108,7 @@ class FaceAuthenticator:
         detected_face: DetectedFace,
         name: str,
         allow_duplicate: bool = False,
+        metadata: dict | None = None,
     ) -> tuple[bool, str]:
         """Extracts embedding from detected face and persists it to repository.
         
@@ -121,7 +133,7 @@ class FaceAuthenticator:
                 )
 
         # Persist to database (SQLite / MongoDB)
-        record_id = self.repository.add_face(clean_name, embedding)
+        record_id = self.repository.add_face(clean_name, embedding, metadata=metadata)
 
         # Refresh in-memory cache
         self.reload_faces()

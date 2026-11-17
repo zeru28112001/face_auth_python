@@ -11,6 +11,8 @@ from face_pipeline import (
     FaceRecognizer,
     FaceAuthenticator,
     LivenessDetector,
+    KYCVerifier,
+    draw_kyc_modal,
     draw_alert_card,
 )
 
@@ -42,7 +44,7 @@ def draw_hud(frame, status_text: str, total_registered: int, threshold: float) -
     cv2.rectangle(overlay, (0, 0), (w, 40), (20, 20, 20), cv2.FILLED)
     cv2.addWeighted(overlay, 0.65, frame, 0.35, 0, frame)
 
-    info_text = f"Faces in DB: {total_registered} | Threshold: {threshold:.2f} | 'r': Register | 'l': List | 'q': Quit"
+    info_text = f"Faces in DB: {total_registered} | 'k': eKYC Onboard | 'r': Register | 'l': List | 'q': Quit"
     cv2.putText(frame, info_text, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (220, 220, 220), 1, cv2.LINE_AA)
 
 
@@ -76,6 +78,14 @@ def run_face_system(
     recognizer = FaceRecognizer()
     authenticator = FaceAuthenticator(recognizer=recognizer, repository=repo, threshold=threshold)
     liveness_detector = LivenessDetector(liveness_threshold=liveness_threshold)
+    kyc_verifier = KYCVerifier(
+        detector=detector,
+        recognizer=recognizer,
+        authenticator=authenticator,
+        repository=repo,
+        liveness_detector=liveness_detector,
+        kyc_threshold=threshold,
+    )
 
     # Open camera
     cap = cv2.VideoCapture(camera_index)
@@ -96,8 +106,10 @@ def run_face_system(
 
     snapshots_dir = Path("snapshots")
     active_alert = None  # Holds active on-screen modal alert {title, lines, type, expires}
+    active_kyc_modal = None  # Holds active eKYC visual verification result {result, expires}
 
     print("\nSystem running! Live controls:")
+    print("  • 'k' : eKYC Identity Onboarding (Verify ID Card vs Live Face)")
     print("  • 'r' : Register currently detected face")
     print("  • 'l' : Print list of registered users in terminal")
     print("  • 's' : Save snapshot image")
@@ -146,15 +158,17 @@ def run_face_system(
                 live_pct = int(round(liveness.liveness_score * 100))
 
                 if is_auth:
+                    is_kyc = auth_result.is_kyc_verified
+                    kyc_badge = " [KYC Verified]" if is_kyc else ""
                     if liveness.is_real:
                         # REAL PERSON (Green)
                         color = (0, 220, 0)
-                        label = f"Granted: {display_name} ({display_sim:.2f}) [Live: {live_pct}%]"
+                        label = f"Granted: {display_name}{kyc_badge} ({display_sim:.2f}) [Live: {live_pct}%]"
                     else:
                         # 2D PHOTO / PHONE SCREEN (Orange Warning)
                         color = (0, 160, 255)
                         attack_tag = f"Image ({liveness.attack_type})" if liveness.attack_type != "NONE" else "Image"
-                        label = f"{attack_tag}, Granted: {display_name} ({display_sim:.2f}) [Live: {live_pct}%]"
+                        label = f"{attack_tag}, Granted: {display_name}{kyc_badge} ({display_sim:.2f}) [Live: {live_pct}%]"
                 else:
                     if liveness.is_real:
                         # UNKNOWN REAL PERSON (Red)
@@ -178,8 +192,13 @@ def run_face_system(
             # Draw HUD
             draw_hud(display_frame, "", len(authenticator._cached_faces), threshold)
 
-            # Draw on-screen alert card if active
-            if active_alert:
+            # Draw on-screen KYC modal if active
+            if active_kyc_modal:
+                if time.time() < active_kyc_modal["expires"]:
+                    draw_kyc_modal(display_frame, active_kyc_modal["result"])
+                else:
+                    active_kyc_modal = None
+            elif active_alert:
                 if time.time() < active_alert["expires"]:
                     draw_alert_card(
                         display_frame,
@@ -227,6 +246,56 @@ def run_face_system(
                     "hint": "Check snapshots/ folder",
                     "type": "SUCCESS",
                     "expires": time.time() + 2.5,
+                }
+
+            elif key == ord('k'):  # eKYC Onboarding
+                print("\n" + "=" * 55)
+                print(">>> eKYC IDENTITY VERIFICATION & ONBOARDING <<<")
+                print("Options:")
+                print("  • Enter file path to ID card (e.g. snapshots/id_card.png)")
+                print("  • Press ENTER to capture ID card from webcam in 3 seconds")
+                sys.stdout.write("ID Card Path [or ENTER for webcam capture]: ")
+                sys.stdout.flush()
+                id_path_input = sys.stdin.readline().strip()
+                sys.stdout.write("Enter Full Legal Name: ")
+                sys.stdout.flush()
+                kyc_name = sys.stdin.readline().strip()
+                sys.stdout.write("Enter ID Document Number: ")
+                sys.stdout.flush()
+                kyc_id_num = sys.stdin.readline().strip()
+                print("=" * 55)
+
+                if not kyc_name:
+                    print("[KYC] Cancelled (name is required).\n")
+                    active_alert = {
+                        "title": "KYC Cancelled",
+                        "message": "Full legal name is required",
+                        "hint": "Press [k] to retry",
+                        "type": "ERROR",
+                        "expires": time.time() + 3.0,
+                    }
+                    continue
+
+                if id_path_input:
+                    card_source = id_path_input
+                else:
+                    print("Hold up ID card directly to camera. Capturing in 3 seconds...")
+                    time.sleep(3.0)
+                    ret_c, card_frame = cap.read()
+                    card_source = card_frame if ret_c and card_frame is not None else frame
+
+                kyc_res = kyc_verifier.verify_and_onboard(
+                    id_image=card_source,
+                    live_frame=frame,
+                    user_name=kyc_name,
+                    id_number=kyc_id_num or None,
+                    auto_register=True,
+                )
+
+                print(f"[{'SUCCESS' if kyc_res.is_verified else 'REJECTED'}] {kyc_res.message}\n")
+                active_kyc_modal = {
+                    "result": kyc_res,
+                    "expires": time.time() + 6.0,
                 }
 
             elif key == ord('r'):  # Register detected face
